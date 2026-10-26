@@ -27,8 +27,11 @@ The bracket uses these 12 teams: Tennessee, Ohio State, Oregon, Clemson, Texas, 
 | File | Description |
 |---|---|
 | `Snyder_Case5_fixed.Rmd` | The full R Markdown analysis and simulator |
+| `results/` | Saved simulation output (championship probabilities, game scores, player stats) |
+| `CFB_pbp_2024.csv` | 2024 play-by-play data (**not included**) |
+| `field_goal_summary_season.csv` | Kicker field goal / extra point data (**not included**) |
 
-> The two CSV files present in the rmd are not included in this repository. They are contracted data sources protected by a non disclosure agreement
+> **The input data is not included in this repository because it is protected by a non-disclosure agreement.** The simulation can only be re-run by someone with access to the same data. Everything the simulation produced is saved in the `results/` folder so the findings can be reviewed without the data.
 
 ## Requirements
 
@@ -40,10 +43,24 @@ The bracket uses these 12 teams: Tennessee, Ohio State, Oregon, Clemson, Texas, 
 install.packages("tidyverse")
 ```
 
+## Results
+
+The `results/` folder contains the output of the simulation run in `Snyder_Case5_fixed.Rmd`:
+
+| File | Contents |
+|---|---|
+| `championship_probabilities.csv` | Share of simulations in which each team reached each stage (second round, semifinals, finals, champion) |
+| `game_scores.csv` | Winner, loser, and score for every simulated game |
+| `player_stats.csv` | Simulated player stat lines for every game |
+
+These were produced with `set.seed(2024)` and 1,000 bracket simulations.
+
 ## Getting started
 
+These steps apply only if you have your own copy of the required data.
+
 1. Clone the repository.
-2. Add `CFB_pbp_2024.csv` and `field_goal_summary_season.csv` to the project folder.
+2. Add `CFB_pbp_2024.csv` and `field_goal_summary_season.csv` to the project folder (see [Required data columns](#required-data-columns) for the format).
 3. **Update the working directory.** The setup chunk contains a hard-coded path from the author's machine:
 
    ```r
