@@ -1,0 +1,49 @@
+stage,team,times,probability
+Reached Second Round,Arizona State,1000,1
+Reached Second Round,Boise State,1000,1
+Reached Second Round,Georgia,1000,1
+Reached Second Round,Oregon,1000,1
+Reached Second Round,Indiana,687,0.687
+Reached Second Round,Penn State,607,0.607
+Reached Second Round,Ohio State,589,0.589
+Reached Second Round,Clemson,519,0.519
+Reached Second Round,Texas,481,0.481
+Reached Second Round,Tennessee,411,0.411
+Reached Second Round,SMU,393,0.393
+Reached Second Round,Notre Dame,313,0.313
+Reached Semifinals,Arizona State,538,0.538
+Reached Semifinals,Boise State,536,0.536
+Reached Semifinals,Oregon,533,0.533
+Reached Semifinals,Indiana,477,0.477
+Reached Semifinals,Georgia,375,0.375
+Reached Semifinals,Ohio State,306,0.306
+Reached Semifinals,Penn State,306,0.306
+Reached Semifinals,Clemson,240,0.24
+Reached Semifinals,Texas,222,0.222
+Reached Semifinals,Tennessee,161,0.161
+Reached Semifinals,SMU,158,0.158
+Reached Semifinals,Notre Dame,148,0.148
+Reached Finals,Oregon,323,0.323
+Reached Finals,Boise State,298,0.298
+Reached Finals,Indiana,274,0.274
+Reached Finals,Arizona State,221,0.221
+Reached Finals,Ohio State,192,0.192
+Reached Finals,Penn State,164,0.164
+Reached Finals,Georgia,135,0.135
+Reached Finals,Clemson,95,0.095
+Reached Finals,Tennessee,89,0.089
+Reached Finals,Texas,80,0.08
+Reached Finals,SMU,71,0.071
+Reached Finals,Notre Dame,58,0.058
+Won Championship,Oregon,170,0.17
+Won Championship,Indiana,163,0.163
+Won Championship,Boise State,161,0.161
+Won Championship,Ohio State,121,0.121
+Won Championship,Arizona State,91,0.091
+Won Championship,Penn State,91,0.091
+Won Championship,Georgia,48,0.048
+Won Championship,Tennessee,40,0.04
+Won Championship,Clemson,34,0.034
+Won Championship,Texas,31,0.031
+Won Championship,SMU,26,0.026
+Won Championship,Notre Dame,24,0.024
