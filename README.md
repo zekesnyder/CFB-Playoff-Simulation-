@@ -26,7 +26,7 @@ The bracket uses these 12 teams: Tennessee, Ohio State, Oregon, Clemson, Texas, 
 
 | File | Description |
 |---|---|
-| `Snyder_Case5_fixed.Rmd` | The full R Markdown analysis and simulator |
+| `Snyder_Case5_v2.Rmd` | The full R Markdown analysis and simulator |
 | `results/` | Saved simulation output (championship probabilities, game scores, player stats) |
 | `CFB_pbp_2024.csv` | 2024 play-by-play data (**not included**) |
 | `field_goal_summary_season.csv` | Kicker field goal / extra point data (**not included**) |
@@ -45,7 +45,7 @@ install.packages("tidyverse")
 
 ## Results
 
-The `results/` folder contains the output of the simulation run in `Snyder_Case5_fixed.Rmd`:
+The `results/` folder contains the output of the simulation run in `Snyder_Case5_v2.Rmd`:
 
 | File | Contents |
 |---|---|
@@ -68,7 +68,7 @@ These steps apply only if you have your own copy of the required data.
    ```
 
    Change this to the folder on your machine, or remove the line if you open the `.Rmd` from its own folder.
-4. Open `Snyder_Case5_fixed.Rmd` in RStudio and run the chunks in order, or knit to HTML.
+4. Open `Snyder_Case5_v2.Rmd` in RStudio and run the chunks in order, or knit to HTML.
 
 The data-loading chunk checks that all required columns exist and that every playoff team appears in the data, and stops with a clear error message if something is missing.
 
@@ -130,13 +130,13 @@ Each team's probabilities are calculated once and saved, so a game only draws ra
 - Yardage category probabilities for runs and passes (negative-yardage plays are capped at 7% of plays)
 - Kickoff distances and kickoff return distribution
 - Punt distance and punt return distributions (league averages are used as a fallback if a team has no data)
-- Fumble rate on runs and interception rate on passes
+- Lost-fumble rate on runs (fumbles the defense recovers) and interception rate on passes
 - Field goal make probability by distance bin (defaults to 60% when there is no data)
 - Extra point percentage of the team's most-used kicker (defaults to 95%)
 - Player usage shares for rushers, passers, and receivers (players under 7.5% usage are grouped as "Player X")
 
 ### Play simulation
-Each play, the offense chooses run or pass based on its play mix. It then draws a yardage category from its own distribution and picks a yard value within that category. Interceptions and fumbles are checked, and the ball changes hands when they occur.
+Each play, the offense chooses run or pass based on its play mix. It then draws a yardage category from its own distribution and picks a yard value from the plays the team actually ran in that category (falling back to league-wide plays when a team has too few). Interceptions and lost fumbles are checked, and the ball changes hands when they occur.
 
 ### Game flow
 - A coin toss decides the opening kickoff, and the other team receives to start the second half.
@@ -152,7 +152,7 @@ To keep the model tractable, the simulator makes these simplifying assumptions:
 - No turnover returns
 - No timeouts
 - No penalties
-- A pass takes 35 seconds and a run takes 45 seconds
+- Simplified clock: 30 seconds per run, 25 seconds per completed pass, and 8 seconds per incompletion (adjustable arguments of `game_simulator()`, checked with the calibration chunk)
 - Extra periods are 5-minute periods, a simplification of NCAA overtime
 - Teams are modeled only from their own 2024 offensive and special teams data; opponent defensive strength is not modeled
 
