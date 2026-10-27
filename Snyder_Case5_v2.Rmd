@@ -1,0 +1,993 @@
+---
+title: "Case 5: College Football Playoff Simulator"
+author: "ZS"
+date: "2024-12-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Notes
+
+**Data columns used**
+
+- `drive_time_seconds_elapsed` is play time
+- `yds_fumble_return`, `yds_int_return`, `yds_kickoff_return`, `yds_punt_return`
+- Kickoffs: `pos_team` is the team returning the kickoff
+- Punts: `pos_team` is the team punting; use `def_pos_team` to get the yards returned for the receiving team
+
+**Assumptions**
+
+- No 2-point conversions
+- No turnover returns
+- No timeouts
+- No penalties
+- Clock: a run takes 35 seconds, a completed pass 30 seconds, and an incompletion (0-yard pass) 8 seconds. These are tunable arguments of `game_simulator()`; the clock stops quickly after incompletions, which raises the number of plays per game toward real levels
+- Yardage on a play is drawn from the team's actual observed plays inside the chosen yardage category, not uniformly from the category's range
+- Only fumbles the offense LOSES (defense recovers) cause a turnover
+- On 4th down a team kicks a field goal if it is 40 yards to goal or closer, otherwise it punts
+- A tied game continues in 5-minute extra periods (a simplification of NCAA overtime)
+
+## Packages
+
+```{r packages}
+library(tidyverse)
+knitr::opts_knit$set(root.dir = "/Users/zekesnyder/Losak/Case 5")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Data
+
+Put `CFB_pbp_2024.csv` and `field_goal_summary_season.csv` in the same folder as this file.
+
+```{r data}
+playdata    <- read.csv("CFB_pbp_2024.csv")
+fg_pat_data <- read_csv("field_goal_summary_season.csv", show_col_types = FALSE)
+
+# The 12 playoff teams. Names must match the team names in playdata.
+teams <- c("Tennessee", "Ohio State", "Oregon", "Clemson", "Texas", "Arizona State",
+           "Indiana", "Notre Dame", "Georgia", "SMU", "Penn State", "Boise State")
+
+# ---- Check that the columns the simulator needs are present ----
+required_cols <- c("pos_team", "def_pos_team", "play_type", "yards_gained", "yards_to_goal",
+                   "yds_kickoff", "yds_kickoff_return", "yds_punted", "yds_punt_return",
+                   "int", "fumble_vec", "fg_make_prob",
+                   "rusher_player_name", "passer_player_name", "receiver_player_name")
+missing_cols <- setdiff(required_cols, names(playdata))
+if (length(missing_cols) > 0) {
+  stop("playdata is missing these columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# ---- Group play types into Run / Pass / Field Goal ----
+playdata <- playdata %>%
+  mutate(play_type_orig = play_type,   # keep the original label (needed to find LOST fumbles)
+         play_type = case_when(
+    play_type %in% c("Rush", "Rushing Touchdown",
+                     "Fumble Recovery (Opponent)", "Fumble Recovery (Offense)") ~ "Run",
+    play_type %in% c("Pass Reception", "Pass Incompletion", "Sack",
+                     "Passing Touchdown", "Interception Return") ~ "Pass",
+    play_type %in% c("Field Goal Good", "Field Goal Missed") ~ "Field Goal",
+    TRUE ~ play_type
+  ))
+
+# ---- Make team names in the kicker data match playdata ----
+team_name_fixes <- c("ALABAMA" = "Alabama", "TEXAS" = "Texas", "OHIO STATE" = "Ohio State",
+                     "OREGON" = "Oregon", "ARIZONA ST" = "Arizona State", "CLEMSON" = "Clemson",
+                     "TENNESSEE" = "Tennessee", "INDIANA" = "Indiana", "NOTRE DAME" = "Notre Dame",
+                     "GEORGIA" = "Georgia", "BOISE ST" = "Boise State", "PENN STATE" = "Penn State")
+
+fg_pat_data <- fg_pat_data %>%
+  mutate(team_name = if_else(team_name %in% names(team_name_fixes),
+                             unname(team_name_fixes[team_name]),
+                             team_name))
+
+# ---- Make sure every playoff team can be found ----
+not_in_plays <- setdiff(teams, unique(playdata$pos_team))
+if (length(not_in_plays) > 0) {
+  stop("These teams are not in playdata$pos_team: ", paste(not_in_plays, collapse = ", "))
+}
+not_in_kickers <- setdiff(teams, unique(fg_pat_data$team_name))
+if (length(not_in_kickers) > 0) {
+  message("No kicker data for: ", paste(not_in_kickers, collapse = ", "),
+          " (a default 95% PAT rate will be used)")
+}
+
+# ---- Fumble check ----
+# fumble_vec flags every fumble, including ones the offense recovers. Only fumbles the
+# defense recovers ("Fumble Recovery (Opponent)") are turnovers, so the simulator uses that rate.
+fumble_check <- playdata %>%
+  filter(play_type == "Run") %>%
+  summarize(any_fumble_rate  = mean(fumble_vec, na.rm = TRUE),
+            lost_fumble_rate = mean(play_type_orig == "Fumble Recovery (Opponent)", na.rm = TRUE))
+print(fumble_check)
+
+if (isTRUE(fumble_check$lost_fumble_rate == 0)) {
+  stop("No 'Fumble Recovery (Opponent)' plays were found in playdata. Check the play_type labels.")
+}
+```
+
+## Team-level helper functions
+
+```{r helpers}
+# Prints a message only when verbose output is switched on (see game_simulator)
+vsay <- function(...) {
+  if (isTRUE(getOption("sim_verbose"))) cat(paste(...), "\n")
+}
+
+team_run_yards <- function(team_name, playdata) {
+  tm <- team_name
+  playdata %>%
+    filter(pos_team == tm, play_type == "Run") %>%
+    pull(yards_gained)
+}
+
+team_pass_yards <- function(team_name, playdata) {
+  tm <- team_name
+  playdata %>%
+    filter(pos_team == tm, play_type == "Pass") %>%
+    pull(yards_gained)
+}
+
+team_kickoff_return_yards <- function(team_name, playdata) {
+  tm <- team_name
+  playdata %>%
+    filter(pos_team == tm, play_type == "Kickoff", !is.na(yds_kickoff_return)) %>%
+    pull(yds_kickoff_return)
+}
+
+team_kickoff_yards <- function(team_name, playdata) {
+  tm <- team_name
+  playdata %>%
+    filter(def_pos_team == tm, play_type == "Kickoff", !is.na(yds_kickoff)) %>%
+    pull(yds_kickoff)
+}
+
+team_punt_return_yards <- function(team_name, playdata) {
+  tm <- team_name
+  playdata %>%
+    filter(def_pos_team == tm, play_type == "Punt", !is.na(yds_punt_return)) %>%
+    pull(yds_punt_return)
+}
+
+# Punting team is pos_team (fixed: this used def_pos_team before)
+team_punt_yards <- function(team_name, playdata) {
+  tm <- team_name
+  playdata %>%
+    filter(pos_team == tm, play_type == "Punt", !is.na(yds_punted)) %>%
+    pull(yds_punted)
+}
+
+team_int_prob <- function(team_name, playdata) {
+  tm <- team_name
+  team_pass_plays <- playdata %>% filter(pos_team == tm, play_type == "Pass")
+  mean(team_pass_plays$int, na.rm = TRUE)
+}
+
+team_fumble_prob <- function(team_name, playdata) {
+  tm <- team_name
+  team_run_plays <- playdata %>% filter(pos_team == tm, play_type == "Run")
+  # Lost fumbles only (the defense recovered)
+  mean(team_run_plays$play_type_orig == "Fumble Recovery (Opponent)", na.rm = TRUE)
+}
+
+team_play_probability <- function(team_name, playdata, included_play_types = c("Run", "Pass")) {
+  tm <- team_name
+  filtered_data <- playdata %>%
+    filter(pos_team == tm, play_type %in% included_play_types)
+
+  filtered_data %>%
+    count(play_type) %>%
+    mutate(probability = n / nrow(filtered_data))
+}
+```
+
+## Probability bins
+
+```{r bins}
+team_pass_probability_bins <- function(team_name, playdata) {
+  pass_yards_vector <- team_pass_yards(team_name, playdata)
+
+  pass_yards_bins <- case_when(
+    pass_yards_vector <= -1 ~ "-inf - -1",
+    pass_yards_vector >= 0  & pass_yards_vector <= 10 ~ "0-10",
+    pass_yards_vector >= 11 & pass_yards_vector <= 20 ~ "11-20",
+    pass_yards_vector >= 21 & pass_yards_vector <= 30 ~ "21-30",
+    pass_yards_vector >= 31 & pass_yards_vector <= 40 ~ "31-40",
+    pass_yards_vector >= 41 & pass_yards_vector <= 50 ~ "41-50",
+    pass_yards_vector >= 51 & pass_yards_vector <= 65 ~ "51-65",
+    pass_yards_vector >= 66 & pass_yards_vector <= 100 ~ "66-100"
+  )
+
+  bin_counts <- table(pass_yards_bins)
+  data.frame(bin = names(bin_counts),
+             count = as.numeric(bin_counts),
+             probability = as.numeric(bin_counts) / length(pass_yards_vector))
+}
+
+team_run_probability_bins <- function(team_name, playdata) {
+  run_yards_vector <- team_run_yards(team_name, playdata)
+
+  run_yards_bins <- case_when(
+    run_yards_vector <= -1 ~ "-inf - -1",
+    run_yards_vector >= 0  & run_yards_vector <= 3  ~ "0-3",
+    run_yards_vector >= 4  & run_yards_vector <= 10 ~ "4-10",
+    run_yards_vector >= 11 & run_yards_vector <= 20 ~ "11-20",
+    run_yards_vector >= 21 & run_yards_vector <= 30 ~ "21-30",
+    run_yards_vector >= 31 & run_yards_vector <= 40 ~ "31-40",
+    run_yards_vector >= 41 & run_yards_vector <= 50 ~ "41-50",
+    run_yards_vector >= 51 & run_yards_vector <= 70 ~ "51-70",
+    run_yards_vector >= 71 & run_yards_vector <= 100 ~ "71-100"
+  )
+
+  bin_counts <- table(run_yards_bins)
+  data.frame(bin = names(bin_counts),
+             count = as.numeric(bin_counts),
+             probability = as.numeric(bin_counts) / length(run_yards_vector))
+}
+
+# Kickoff return distribution for a receiving team. Returns NULL if the team has no returns.
+kickoff_return_probability <- function(team_name, playdata) {
+  return_yards <- team_kickoff_return_yards(team_name, playdata)
+  if (length(return_yards) == 0) return(NULL)
+
+  bins <- c(-Inf, 10, 24, 25, 35, 50, 70, Inf)
+  bin_labels <- c("0-10", "11-24", "25", "26-35", "36-50", "51-70", "71-100")
+
+  bin_counts <- sapply(seq_along(bin_labels), function(i) {
+    sum(return_yards > bins[i] & return_yards <= bins[i + 1])
+  })
+
+  data.frame(Bin = bin_labels,
+             Probability = round(bin_counts / sum(bin_counts), 3))
+}
+
+team_punt_yard_prob <- function(team_name, playdata) {
+  punted_yards <- team_punt_yards(team_name, playdata)
+  bins <- c(-Inf, 10, 24, 35, 50, 70, Inf)
+  bin_labels <- c("0-10", "11-24", "25-35", "36-50", "51-70", "71-100")
+  prop.table(table(cut(punted_yards, breaks = bins, labels = bin_labels,
+                       right = TRUE, include.lowest = TRUE)))
+}
+
+team_punt_return_yard_prob <- function(team_name, playdata) {
+  punt_return_yards <- team_punt_return_yards(team_name, playdata)
+  bins <- c(-Inf, 0, 10, 24, 35, 50, 70, Inf)
+  bin_labels <- c("-Inf-0", "1-10", "11-24", "25-35", "36-50", "51-70", "71-100")
+  prop.table(table(cut(punt_return_yards, breaks = bins, labels = bin_labels,
+                       right = TRUE, include.lowest = TRUE)))
+}
+```
+
+## Simulation lookup tables
+
+The simulator draws yardage from categories and then picks a yard value inside the chosen category. These tables define the categories once so every function uses the same ones.
+
+```{r constants}
+# ---- Pass and run yardage categories ----
+pass_breaks <- c(-Inf, -1, 0, 10, 20, 30, 40, Inf)
+pass_labels <- c("Negative", "0", "1-10", "11-20", "21-30", "31-40", "41+")
+pass_ranges <- list("Negative" = -20:-1, "0" = 0, "1-10" = 1:10, "11-20" = 11:20,
+                    "21-30" = 21:30, "31-40" = 31:40, "41+" = 41:100)
+
+run_breaks <- c(-Inf, -1, 3, 6, 10, 20, 30, 40, 50, Inf)
+run_labels <- c("Negative", "0-3", "4-6", "7-10", "11-20", "21-30", "31-40", "41-50", "51+")
+run_ranges <- list("Negative" = -20:-1, "0-3" = 0:3, "4-6" = 4:6, "7-10" = 7:10,
+                   "11-20" = 11:20, "21-30" = 21:30, "31-40" = 31:40,
+                   "41-50" = 41:50, "51+" = 51:100)
+
+# ---- Kickoff returns ----
+kick_return_breaks <- c(-Inf, 10, 24, 25, 35, 50, 70, Inf)
+kick_return_labels <- c("0-10", "11-24", "25", "26-35", "36-50", "51-70", "71-100")
+kick_return_ranges <- list("0-10" = 0:10, "11-24" = 11:24, "25" = 25, "26-35" = 26:35,
+                           "36-50" = 36:50, "51-70" = 51:70, "71-100" = 71:100)
+
+# ---- Punts and punt returns ----
+punt_breaks <- c(-Inf, 10, 24, 35, 50, 70, Inf)
+punt_labels <- c("0-10", "11-24", "25-35", "36-50", "51-70", "71-100")
+punt_ranges <- list("0-10" = 0:10, "11-24" = 11:24, "25-35" = 25:35,
+                    "36-50" = 36:50, "51-70" = 51:70, "71-100" = 71:100)
+
+punt_return_breaks <- c(-Inf, 0, 10, 24, 35, 50, 70, Inf)
+punt_return_labels <- c("-Inf-0", "1-10", "11-24", "25-35", "36-50", "51-70", "71-100")
+punt_return_ranges <- list("-Inf-0" = 0, "1-10" = 1:10, "11-24" = 11:24, "25-35" = 25:35,
+                           "36-50" = 36:50, "51-70" = 51:70, "71-100" = 71:100)
+
+# ---- Field goal distance bins (yards to goal) ----
+fg_bin_of <- function(y) {
+  case_when(y <= 20 ~ "1-20", y <= 30 ~ "21-30", y <= 40 ~ "31-40", TRUE ~ NA_character_)
+}
+```
+
+## Team profiles 
+
+Each team's probabilities are calculated once here. During a game the simulator only draws random numbers from these saved profiles, instead of re-filtering the full play-by-play data on every play.
+
+```{r profiles}
+# Pick one value, optionally with probabilities
+sample_one <- function(values, probs = NULL) {
+  values[sample.int(length(values), 1, prob = probs)]
+}
+
+# Share of values falling in each bin (NULL if there is no data)
+bin_probs <- function(x, breaks, labels) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NULL)
+  p <- as.numeric(table(cut(x, breaks = breaks, labels = labels,
+                            right = TRUE, include.lowest = TRUE)))
+  names(p) <- labels
+  p / sum(p)
+}
+
+# Yardage category probabilities. Negative plays are capped at 7% and the excess goes
+# to the first non-negative category.
+capped_category_probs <- function(yards, breaks, labels, zero_label) {
+  yards <- yards[!is.na(yards)]
+  counts <- as.numeric(table(cut(yards, breaks = breaks, labels = labels, right = TRUE)))
+  names(counts) <- labels
+  total <- sum(counts)
+
+  negative_prob <- counts["Negative"] / total
+  if (negative_prob > 0.07) {
+    excess <- negative_prob - 0.07
+    counts["Negative"] <- total * 0.07
+    counts[zero_label] <- counts[zero_label] + total * excess
+  }
+  counts / total
+}
+
+# Players chosen by usage share. Anyone under 7.5% of usage becomes "Player X".
+usage_table <- function(values) {
+  values <- values[!is.na(values) & values != ""]
+  if (length(values) == 0) return(list(names = "Player X", probs = 1))
+
+  usage <- table(values)
+  probs <- as.numeric(usage) / sum(usage)
+  player_names <- names(usage)
+  player_names[probs < 0.075] <- "Player X"
+
+  combined <- tapply(probs, player_names, sum)
+  list(names = names(combined), probs = as.numeric(combined))
+}
+
+build_one_profile <- function(tm, playdata, fg_pat_data,
+                              league_punt_probs, league_punt_return_probs,
+                              league_run_obs, league_pass_obs) {
+
+  team_plays <- playdata %>% filter(pos_team == tm)
+  runs   <- team_plays %>% filter(play_type == "Run")
+  passes <- team_plays %>% filter(play_type == "Pass")
+
+  if (nrow(runs) == 0 || nrow(passes) == 0) {
+    stop("No run or pass plays found for the team: ", tm)
+  }
+
+  # ---- Run/pass mix ----
+  play_mix <- c(Run = nrow(runs), Pass = nrow(passes))
+  play_mix <- play_mix / sum(play_mix)
+
+  # ---- Kickoffs ----
+  kick_yards <- team_plays %>%
+    filter(play_type == "Kickoff", !is.na(yds_kickoff)) %>%
+    pull(yds_kickoff)
+
+  kick_return_yards <- team_plays %>%
+    filter(play_type == "Kickoff", !is.na(yds_kickoff_return)) %>%
+    pull(yds_kickoff_return)
+
+  # ---- Punts (as the punting team) and punt returns (as the receiving team) ----
+  punt_probs <- bin_probs(team_plays %>% filter(play_type == "Punt") %>% pull(yds_punted),
+                          punt_breaks, punt_labels)
+  if (is.null(punt_probs)) punt_probs <- league_punt_probs
+
+  punt_return_probs <- bin_probs(
+    playdata %>% filter(def_pos_team == tm, play_type == "Punt") %>% pull(yds_punt_return),
+    punt_return_breaks, punt_return_labels)
+  if (is.null(punt_return_probs)) punt_return_probs <- league_punt_return_probs
+
+  # ---- Turnover rates ----
+  # Lost fumbles only: runs where the defense recovered the ball
+  fumble_prob <- mean(runs$play_type_orig == "Fumble Recovery (Opponent)", na.rm = TRUE)
+  if (is.na(fumble_prob)) fumble_prob <- 0
+  int_prob <- mean(passes$int, na.rm = TRUE)
+  if (is.na(int_prob)) int_prob <- 0
+
+  # ---- Field goal make probability by distance bin (default 0.6 if no data) ----
+  fg_probs <- c("1-20" = 0.6, "21-30" = 0.6, "31-40" = 0.6)
+  fg_by_bin <- team_plays %>%
+    mutate(fg_bin = fg_bin_of(yards_to_goal)) %>%
+    filter(!is.na(fg_bin)) %>%
+    group_by(fg_bin) %>%
+    summarize(p = mean(fg_make_prob, na.rm = TRUE), .groups = "drop")
+  for (r in seq_len(nrow(fg_by_bin))) {
+    if (!is.na(fg_by_bin$p[r])) fg_probs[[fg_by_bin$fg_bin[r]]] <- fg_by_bin$p[r]
+  }
+
+  # ---- Extra point percentage of the team's most-used kicker (default 95%) ----
+  pat_prob <- 0.95
+  kicker_rows <- fg_pat_data %>% filter(team_name == tm)
+  if (nrow(kicker_rows) > 0) {
+    top_kicker <- kicker_rows %>%
+      group_by(player) %>%
+      summarize(attempts = n(), kicker_pct = mean(pat_percent, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(attempts)) %>%
+      slice(1)
+    if (!is.na(top_kicker$kicker_pct)) {
+      pat_prob <- top_kicker$kicker_pct
+      if (pat_prob > 1) pat_prob <- pat_prob / 100
+    }
+  }
+
+  list(
+    play_mix = play_mix,
+    run_probs = capped_category_probs(runs$yards_gained, run_breaks, run_labels, "0-3"),
+    pass_probs = capped_category_probs(passes$yards_gained, pass_breaks, pass_labels, "0"),
+    # Observed yardage, used to draw a realistic yard value inside the chosen category
+    run_obs = runs$yards_gained[!is.na(runs$yards_gained)],
+    pass_obs = passes$yards_gained[!is.na(passes$yards_gained)],
+    league_run_obs = league_run_obs,
+    league_pass_obs = league_pass_obs,
+    kick_yards = kick_yards,
+    kick_return_probs = bin_probs(kick_return_yards, kick_return_breaks, kick_return_labels),
+    punt_probs = punt_probs,
+    punt_return_probs = punt_return_probs,
+    fumble_prob = fumble_prob,
+    int_prob = int_prob,
+    fg_probs = fg_probs,
+    pat_prob = pat_prob,
+    rushers = usage_table(team_plays$rusher_player_name),
+    passers = usage_table(team_plays$passer_player_name),
+    receivers = usage_table(team_plays$receiver_player_name)
+  )
+}
+
+# Builds profiles for a set of teams
+build_team_profiles <- function(teams, playdata, fg_pat_data) {
+
+  # League-wide punt data, used if a team has none of its own
+  league_punt_probs <- bin_probs(
+    playdata %>% filter(play_type == "Punt") %>% pull(yds_punted),
+    punt_breaks, punt_labels)
+  league_punt_return_probs <- bin_probs(
+    playdata %>% filter(play_type == "Punt") %>% pull(yds_punt_return),
+    punt_return_breaks, punt_return_labels)
+
+  # League-wide yardage, used when a team has too few plays in a yardage category
+  league_run_obs  <- playdata %>% filter(play_type == "Run")  %>% pull(yards_gained)
+  league_pass_obs <- playdata %>% filter(play_type == "Pass") %>% pull(yards_gained)
+  league_run_obs  <- league_run_obs[!is.na(league_run_obs)]
+  league_pass_obs <- league_pass_obs[!is.na(league_pass_obs)]
+
+  team_profiles <- lapply(teams, function(tm) {
+    build_one_profile(tm, playdata, fg_pat_data, league_punt_probs, league_punt_return_probs,
+                      league_run_obs, league_pass_obs)
+  })
+  names(team_profiles) <- teams
+
+  list(teams = team_profiles)
+}
+
+# Build the profiles for all 12 playoff teams (runs once)
+profiles <- build_team_profiles(teams, playdata, fg_pat_data)
+
+# Look at one team's profile as a check
+profiles$teams[["Texas"]]$play_mix
+profiles$teams[["Texas"]]$run_probs
+```
+
+## Simulation functions
+
+```{r sim-functions}
+# ------------------------------------------------------------------
+# Kickoff: returns where the receiving team starts (yards to goal)
+# ------------------------------------------------------------------
+kickoff_sim <- function(prof) {
+
+  # No kickoff data: assume a touchback
+  if (length(prof$kick_yards) == 0) {
+    return(list(kickoff_yardage = 65, return_yardage = 0, yards_to_goal = 75))
+  }
+
+  selected_kick <- sample_one(prof$kick_yards)
+
+  if (selected_kick >= 65) {
+    vsay("Touchback: ball is placed at 75 yards to goal.")
+    return(list(kickoff_yardage = selected_kick, return_yardage = 0, yards_to_goal = 75))
+  }
+
+  if (is.null(prof$kick_return_probs)) {
+    return_yardage <- 25   # no return data: assume a 25-yard return
+  } else {
+    selected_bin <- sample_one(kick_return_labels, prof$kick_return_probs)
+    selected_range <- kick_return_ranges[[selected_bin]]
+    return_yardage <- selected_range[sample.int(length(selected_range), 1)]
+  }
+
+  # The kick starts at the 35, so the ball lands 35 + kick yards from the kicking team's goal
+  yards_to_goal <- min(max(35 + selected_kick - return_yardage, 1), 99)
+
+  list(kickoff_yardage = selected_kick,
+       return_yardage = return_yardage,
+       yards_to_goal = yards_to_goal)
+}
+
+# ------------------------------------------------------------------
+# Yards gained: pick a category by probability, then a yard value inside it
+# ------------------------------------------------------------------
+draw_yards <- function(category_probs, ranges, observed, league_observed, min_pool = 5) {
+  selected_category <- names(category_probs)[sample.int(length(category_probs), 1, prob = category_probs)]
+  selected_range <- ranges[[selected_category]]
+
+  # Draw from the yards this team actually gained inside the category. If the team has
+  # too few plays there, use league-wide plays; as a last resort use the whole range.
+  pool <- observed[observed %in% selected_range]
+  if (length(pool) < min_pool) pool <- league_observed[league_observed %in% selected_range]
+  if (length(pool) == 0) pool <- selected_range
+
+  pool[sample.int(length(pool), 1)]
+}
+
+generate_random_passing_yards <- function(prof) {
+  draw_yards(prof$pass_probs, pass_ranges, prof$pass_obs, prof$league_pass_obs)
+}
+generate_random_running_yards <- function(prof) {
+  draw_yards(prof$run_probs, run_ranges, prof$run_obs, prof$league_run_obs)
+}
+
+# ------------------------------------------------------------------
+# Turnovers
+# ------------------------------------------------------------------
+fumble_checker <- function(prof) {
+  list(fumble_probability = prof$fumble_prob,
+       fumble_occurred = runif(1) < prof$fumble_prob)
+}
+
+int_checker <- function(prof) {
+  list(interception_probability = prof$int_prob,
+       interception_occurred = runif(1) < prof$int_prob)
+}
+
+# ------------------------------------------------------------------
+# Field goal (only used at 40 yards to goal or closer)
+# ------------------------------------------------------------------
+field_goal_sim <- function(prof, yards_to_goal) {
+  if (yards_to_goal > 40) stop("This function only works for distances <= 40 yards.")
+
+  p_make <- prof$fg_probs[[fg_bin_of(yards_to_goal)]]
+  list(fg_make_probability = p_make,
+       fg_made = runif(1) < p_make)
+}
+
+# ------------------------------------------------------------------
+# Punt: returns where the receiving team starts (yards to goal)
+# ------------------------------------------------------------------
+punt_sim <- function(kicker, receiver, starting_field_position) {
+
+  punt_range <- punt_ranges[[sample_one(punt_labels, kicker$punt_probs)]]
+  return_range <- punt_return_ranges[[sample_one(punt_return_labels, receiver$punt_return_probs)]]
+
+  selected_punt_yardage <- punt_range[sample.int(length(punt_range), 1)]
+  selected_return_yardage <- return_range[sample.int(length(return_range), 1)]
+
+  # Receiving team's yards to goal after the punt and return
+  raw_yards_to_goal <- (100 - starting_field_position) + selected_punt_yardage - selected_return_yardage
+
+  if (raw_yards_to_goal >= 100) {
+    resulting_yards_to_goal <- 80          # touchback: ball goes to the 20
+  } else {
+    resulting_yards_to_goal <- min(max(raw_yards_to_goal, 1), 99)
+  }
+
+  list(selected_punt_yardage = selected_punt_yardage,
+       selected_return_yardage = selected_return_yardage,
+       resulting_yards_to_goal = resulting_yards_to_goal)
+}
+
+# ------------------------------------------------------------------
+# Extra point
+# ------------------------------------------------------------------
+pat_sim <- function(prof) {
+  if (runif(1) <= prof$pat_prob) "Make" else "Miss"
+}
+
+# ------------------------------------------------------------------
+# Who is involved in a play, chosen by usage share
+# ------------------------------------------------------------------
+players_for_play <- function(prof, play_type) {
+  if (play_type == "Run") {
+    list(rusher = sample_one(prof$rushers$names, prof$rushers$probs))
+  } else if (play_type == "Pass") {
+    list(passer = sample_one(prof$passers$names, prof$passers$probs),
+         receiver = sample_one(prof$receivers$names, prof$receivers$probs))
+  } else {
+    stop("Invalid play type. Use 'Run' or 'Pass'.")
+  }
+}
+```
+
+## Game simulator
+
+```{r game-simulator}
+empty_stat_line <- function() {
+  list(rushing_yards = 0, passing_yards = 0, receiving_yards = 0,
+       touchdowns = 0, fumbles = 0, interceptions = 0)
+}
+
+# Adds to a player's stat line (skips "Player X" and NA players)
+add_stat <- function(stats, team, player, field, amount) {
+  if (is.null(player) || is.na(player) || player == "Player X") return(stats)
+  if (is.null(stats[[team]][[player]])) stats[[team]][[player]] <- empty_stat_line()
+  stats[[team]][[player]][[field]] <- stats[[team]][[player]][[field]] + amount
+  stats
+}
+
+# Plays one game. Pass `profiles` (from build_team_profiles) to run many games quickly.
+# If profiles is NULL, they are built from playdata and fg_pat_data for these two teams.
+game_simulator <- function(team1, team2, playdata = NULL, fg_pat_data = NULL,
+                           total_game_time = 3600, verbose = FALSE, profiles = NULL,
+                           run_time = 30, pass_time = 25, incomplete_time = 8) {
+
+  old_opts <- options(sim_verbose = verbose)
+  on.exit(options(old_opts), add = TRUE)
+
+  team1 <- as.character(team1)
+  team2 <- as.character(team2)
+  if (team1 == team2) stop("A team cannot play itself.")
+
+  if (is.null(profiles)) {
+    if (is.null(playdata) || is.null(fg_pat_data)) {
+      stop("Supply playdata and fg_pat_data, or a profiles object.")
+    }
+    profiles <- build_team_profiles(c(team1, team2), playdata, fg_pat_data)
+  }
+  P <- profiles$teams
+
+  other_team <- function(tm) if (tm == team1) team2 else team1
+
+  score <- c(0, 0)
+  names(score) <- c(team1, team2)
+
+  stats <- list()
+  stats[[team1]] <- list()
+  stats[[team2]] <- list()
+
+  start_kickoff_drive <- function(receiving) {
+    k <- kickoff_sim(P[[receiving]])
+    vsay(receiving, "starts with", k$yards_to_goal, "yards to goal after the kickoff.")
+    k$yards_to_goal
+  }
+
+  # ---- Coin toss and opening kickoff ----
+  possession <- sample(c(team1, team2), 1)
+  opening_receiver <- possession
+  vsay(possession, "wins the coin toss and will receive the ball first.")
+
+  yards_to_goal <- start_kickoff_drive(possession)
+  down <- 1
+  distance_to_first_down <- 10
+  current_time <- total_game_time
+  halftime_done <- FALSE
+  extra_periods <- 0
+  plays <- 0   # total plays from scrimmage, used to check the clock settings
+
+  repeat {
+    while (current_time > 0) {
+
+      # ---- Halftime: the team that did not receive the opening kick receives ----
+      if (!halftime_done && current_time <= total_game_time / 2) {
+        halftime_done <- TRUE
+        vsay("Halftime!")
+        possession <- other_team(opening_receiver)
+        yards_to_goal <- start_kickoff_drive(possession)
+        down <- 1
+        distance_to_first_down <- 10
+      }
+
+      # ---- Play call ----
+      playcall <- sample_one(c("Run", "Pass"), P[[possession]]$play_mix)
+
+      rusher <- NA_character_
+      passer <- NA_character_
+      receiver <- NA_character_
+
+      if (playcall == "Run") {
+        yards_gained <- generate_random_running_yards(P[[possession]])
+        time_consumed <- run_time
+        rusher <- players_for_play(P[[possession]], "Run")$rusher
+      } else {
+        yards_gained <- generate_random_passing_yards(P[[possession]])
+        # A 0-yard pass is treated as an incompletion: the clock stops, so it uses little time
+        time_consumed <- if (yards_gained == 0) incomplete_time else pass_time
+        pass_players <- players_for_play(P[[possession]], "Pass")
+        passer <- pass_players$passer
+        receiver <- pass_players$receiver
+      }
+
+      current_time <- current_time - time_consumed
+      plays <- plays + 1
+
+      # ---- Interception (no yards gained, ball goes to the other team) ----
+      if (playcall == "Pass" && int_checker(P[[possession]])$interception_occurred) {
+        vsay("Interception by", possession, "at", yards_to_goal, "yards to goal!")
+        stats <- add_stat(stats, possession, passer, "interceptions", 1)
+        possession <- other_team(possession)
+        yards_to_goal <- min(max(100 - yards_to_goal, 1), 99)
+        down <- 1
+        distance_to_first_down <- 10
+        next
+      }
+
+      # ---- Apply the play ----
+      yards_to_goal <- min(yards_to_goal - yards_gained, 99)
+
+      if (playcall == "Run") {
+        stats <- add_stat(stats, possession, rusher, "rushing_yards", yards_gained)
+        vsay(possession, "-", rusher, "rushes for", yards_gained, "yards. Yards to goal:", yards_to_goal)
+      } else {
+        stats <- add_stat(stats, possession, passer, "passing_yards", yards_gained)
+        stats <- add_stat(stats, possession, receiver, "receiving_yards", yards_gained)
+        vsay(possession, "-", passer, "to", receiver, "for", yards_gained, "yards. Yards to goal:", yards_to_goal)
+      }
+
+      # ---- Touchdown (6 points, then the extra point) ----
+      if (yards_to_goal <= 0) {
+        vsay(possession, "scores a touchdown!")
+        score[possession] <- score[possession] + 6
+
+        scorer <- if (playcall == "Run") rusher else receiver
+        stats <- add_stat(stats, possession, scorer, "touchdowns", 1)
+
+        if (pat_sim(P[[possession]]) == "Make") {
+          score[possession] <- score[possession] + 1
+        }
+
+        possession <- other_team(possession)
+        yards_to_goal <- start_kickoff_drive(possession)
+        down <- 1
+        distance_to_first_down <- 10
+        next
+      }
+
+      # ---- Fumble on a run ----
+      if (playcall == "Run" && fumble_checker(P[[possession]])$fumble_occurred) {
+        vsay("Fumble by", possession, "at", yards_to_goal, "yards to goal!")
+        stats <- add_stat(stats, possession, rusher, "fumbles", 1)
+        possession <- other_team(possession)
+        yards_to_goal <- min(max(100 - yards_to_goal, 1), 99)
+        down <- 1
+        distance_to_first_down <- 10
+        next
+      }
+
+      # ---- Downs ----
+      if (yards_gained >= distance_to_first_down) {
+        down <- 1
+        distance_to_first_down <- 10
+        vsay("First down!")
+      } else {
+        down <- down + 1
+        distance_to_first_down <- distance_to_first_down - yards_gained
+      }
+
+      # ---- Fourth down: field goal if close enough, otherwise punt ----
+      if (down >= 4) {
+        if (yards_to_goal <= 40) {
+          fg_result <- field_goal_sim(P[[possession]], yards_to_goal)
+          if (fg_result$fg_made) {
+            vsay(possession, "makes a field goal!")
+            score[possession] <- score[possession] + 3
+            possession <- other_team(possession)
+            yards_to_goal <- start_kickoff_drive(possession)
+          } else {
+            vsay(possession, "misses the field goal.")
+            # Other team takes over at the spot of the kick (7 yards behind the line)
+            new_yards_to_goal <- min(80, 100 - (yards_to_goal + 7))
+            possession <- other_team(possession)
+            yards_to_goal <- min(max(new_yards_to_goal, 1), 99)
+          }
+        } else {
+          receiving <- other_team(possession)
+          punt_result <- punt_sim(P[[possession]], P[[receiving]], yards_to_goal)
+          vsay(possession, "punts.", receiving, "has", punt_result$resulting_yards_to_goal, "yards to goal.")
+          possession <- receiving
+          yards_to_goal <- punt_result$resulting_yards_to_goal
+        }
+        down <- 1
+        distance_to_first_down <- 10
+      }
+    }
+
+    # ---- End of regulation or an extra period: play on if tied ----
+    if (score[team1] != score[team2] || extra_periods >= 10) break
+    extra_periods <- extra_periods + 1
+    current_time <- 300
+    vsay("Tied game - playing an extra period.")
+  }
+
+  # ---- Player stat lines ----
+  stats_to_df <- function(tm) {
+    players <- names(stats[[tm]])
+    if (length(players) == 0) return(NULL)
+    bind_rows(lapply(players, function(p) {
+      s <- stats[[tm]][[p]]
+      tibble(player = p, team = tm,
+             touchdowns = s$touchdowns, rushing_yards = s$rushing_yards,
+             passing_yards = s$passing_yards, receiving_yards = s$receiving_yards,
+             fumbles = s$fumbles, interceptions = s$interceptions)
+    }))
+  }
+
+  empty_stats <- tibble(player = character(), team = character(),
+                        touchdowns = numeric(), rushing_yards = numeric(),
+                        passing_yards = numeric(), receiving_yards = numeric(),
+                        fumbles = numeric(), interceptions = numeric())
+
+  player_stats_df <- bind_rows(empty_stats, stats_to_df(team1), stats_to_df(team2))
+
+  # ---- Final result (a coin flip decides only if still tied after 10 extra periods) ----
+  s1 <- unname(score[team1])
+  s2 <- unname(score[team2])
+  winner <- if (s1 > s2) team1 else if (s2 > s1) team2 else sample(c(team1, team2), 1)
+
+  game_outcome <- data.frame(
+    winner = winner,
+    loser = other_team(winner),
+    team1_score = s1,
+    team2_score = s2,
+    score_differential = abs(s1 - s2),
+    total_plays = plays,
+    stringsAsFactors = FALSE
+  )
+
+  list(player_stats_df = player_stats_df, game_outcome = game_outcome)
+}
+```
+
+## Quick test: one game
+
+```{r test-one-game}
+set.seed(1551)
+one_game <- game_simulator("Texas", "Georgia", profiles = profiles)
+one_game$game_outcome
+head(one_game$player_stats_df)
+```
+
+## Calibration check
+
+```{r calibration}
+# Real plays from scrimmage per game, both teams combined
+real_plays <- playdata %>%
+  filter(pos_team %in% teams, play_type %in% c("Run", "Pass")) %>%
+  group_by(pos_team) %>%
+  summarize(plays_per_game = n() / n_distinct(game_id), .groups = "drop") %>%
+  summarize(real_total_plays = 2 * mean(plays_per_game))
+
+# Simulated games between random pairs of playoff teams
+set.seed(99)
+calib <- map_dfr(1:300, function(i) {
+  m <- sample(teams, 2)
+  game_simulator(m[1], m[2], profiles = profiles)$game_outcome
+})
+
+calib %>%
+  summarize(sim_total_plays   = mean(total_plays),
+            sim_points_per_team = mean(c(team1_score, team2_score))) %>%
+  bind_cols(real_plays)
+```
+
+To watch a game play by play (long output), run this instead:
+
+```{r verbose-game, eval=FALSE}
+game_simulator("Texas", "Georgia", profiles = profiles, verbose = TRUE)
+```
+
+## Playoff bracket simulator
+
+```{r bracket-function}
+simulate_bracket <- function(teams, game_simulator, playdata, fg_pat_data,
+                             num_simulations = 1, profiles = NULL) {
+
+  # Calculate each team's probabilities once, unless profiles were passed in
+  if (is.null(profiles)) profiles <- build_team_profiles(teams, playdata, fg_pat_data)
+
+  # Plays one round of games and collects winners, scores, and player stats
+  run_round <- function(matchups, round_name, sim_id) {
+    results <- lapply(matchups, function(m) game_simulator(m[1], m[2], profiles = profiles))
+
+    list(
+      winners = vapply(results, function(r) r$game_outcome$winner, character(1)),
+      scores = bind_rows(lapply(results, function(r) {
+        mutate(r$game_outcome, round = round_name, simulation = sim_id)
+      })),
+      stats = bind_rows(lapply(results, function(r) {
+        mutate(r$player_stats_df, round = round_name, simulation = sim_id)
+      }))
+    )
+  }
+
+  score_list <- list()
+  stats_list <- list()
+  advance_list <- list()
+
+  for (i in seq_len(num_simulations)) {
+
+    # ---- First round (seeds 5-12) ----
+    r1 <- run_round(list(c("Tennessee", "Ohio State"),
+                         c("Clemson", "Texas"),
+                         c("Indiana", "Notre Dame"),
+                         c("SMU", "Penn State")),
+                    "First Round", i)
+
+    # ---- Second round (top 4 seeds join) ----
+    r2 <- run_round(list(c(r1$winners[1], "Oregon"),
+                         c(r1$winners[2], "Arizona State"),
+                         c(r1$winners[3], "Georgia"),
+                         c(r1$winners[4], "Boise State")),
+                    "Second Round", i)
+
+    # ---- Semifinals ----
+    r3 <- run_round(list(c(r2$winners[1], r2$winners[2]),
+                         c(r2$winners[3], r2$winners[4])),
+                    "Semifinals", i)
+
+    # ---- Final ----
+    r4 <- run_round(list(c(r3$winners[1], r3$winners[2])), "Finals", i)
+
+    score_list[[i]] <- bind_rows(r1$scores, r2$scores, r3$scores, r4$scores)
+    stats_list[[i]] <- bind_rows(r1$stats, r2$stats, r3$stats, r4$stats)
+
+    advance_list[[i]] <- bind_rows(
+      tibble(team = c("Oregon", "Georgia", "Boise State", "Arizona State", r1$winners),
+             stage = "Reached Second Round"),
+      tibble(team = r2$winners, stage = "Reached Semifinals"),
+      tibble(team = r3$winners, stage = "Reached Finals"),
+      tibble(team = r4$winners, stage = "Won Championship")
+    )
+
+    if (num_simulations >= 100 && i %% 100 == 0) {
+      message("Finished simulation ", i, " of ", num_simulations)
+    }
+  }
+
+  # Share of simulations in which each team reached each stage
+  probabilities <- bind_rows(advance_list) %>%
+    count(stage, team, name = "times") %>%
+    mutate(probability = times / num_simulations) %>%
+    arrange(factor(stage, levels = c("Reached Second Round", "Reached Semifinals",
+                                     "Reached Finals", "Won Championship")),
+            desc(probability))
+
+  list(player_stats = bind_rows(stats_list),
+       score_data = bind_rows(score_list),
+       probabilities = probabilities)
+}
+```
+
+## Run the bracket
+
+```{r run-bracket}
+set.seed(6767)
+bracket_results <- simulate_bracket(teams, game_simulator, playdata, fg_pat_data,
+                                    num_simulations = 1, profiles = profiles)
+
+bracket_results$score_data
+head(bracket_results$player_stats)
+```
+
+Run many simulations to estimate each team's chances:
+
+```{r many-simulations, eval=FALSE}
+# system(paste("caffeinate -i -w", Sys.getpid()), wait = FALSE)
+
+set.seed(2024)
+many_results <- simulate_bracket(teams, game_simulator, playdata, fg_pat_data,
+                                 num_simulations = 1000, profiles = profiles)
+
+dir.create("results", showWarnings = FALSE)
+write_csv(many_results$probabilities, "results/championship_probabilities.csv")
+write_csv(many_results$score_data,    "results/game_scores.csv")
+write_csv(many_results$player_stats,  "results/player_stats.csv")
+
+many_results$probabilities %>% filter(stage == "Won Championship")
+```
